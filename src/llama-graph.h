@@ -38,6 +38,7 @@ enum llm_ffn_op_type {
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
     LLM_FFN_GEGLU,
+    LLM_FFN_REGLU,
 };
 
 enum llm_ffn_gate_type {
@@ -329,6 +330,17 @@ public:
     const llama_memory_hybrid_context * mctx;
 };
 
+// TODO: remove this when ggml_scale_add is implemented
+class llm_graph_input_one : public llm_graph_input_i {
+public:
+    llm_graph_input_one() {}
+    virtual ~llm_graph_input_one() = default;
+
+    void set_input(const llama_ubatch *) override;
+
+    ggml_tensor * one = nullptr; // F32
+};
+
 //
 // llm_graph_result
 //
@@ -412,6 +424,9 @@ struct llm_graph_params {
     const llm_graph_cb & cb;
 };
 
+// used in build_rs to properly order writes and avoid unnecessary copies
+using llm_graph_get_rows_fn = std::function<ggml_tensor * (ggml_context *, ggml_tensor * states, ggml_tensor * ids)>;
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -464,6 +479,7 @@ struct llm_graph_context {
     std::unique_ptr<llm_graph_result> res;
 
     llm_graph_context(const llm_graph_params & params);
+    virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
@@ -589,14 +605,15 @@ struct llm_graph_context {
 
     llm_graph_input_attn_kv_unified_iswa * build_attn_inp_kv_unified_iswa() const;
 
+    // note: if k_cur or v_cur are not provided, they will not be stored in the memory
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv_unified_iswa * inp,
             ggml_cgraph * gf,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
-            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
-            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens] optional
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens] optional
             ggml_tensor * kq_b,
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
@@ -649,7 +666,7 @@ struct llm_graph_context {
                uint32_t   kv_head,
                uint32_t   kv_size,
                 int32_t   rs_zero,
-                   bool   avoid_copies = false) const;
+            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 
@@ -659,7 +676,7 @@ struct llm_graph_context {
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs,
-                   bool   avoid_copies = false) const;
+            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
     ggml_tensor * build_rs(
             llm_graph_input_mem_hybrid * inp,
@@ -667,7 +684,7 @@ struct llm_graph_context {
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs,
-                   bool   avoid_copies = false) const;
+            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
