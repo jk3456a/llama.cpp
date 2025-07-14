@@ -11,16 +11,20 @@ import csv
 import json
 import sys
 import re
+import itertools
 from datetime import datetime
 from pathlib import Path
+import multiprocessing
 
 # 配置参数
-MODEL_DIR = "/Users/yummy/workspace/models"
+MODEL_DIR = "/home/modelbest/workspace/lizhen/Models/need-test/"
 LLAMA_BENCH_PATH = "./tools/llama-bench/llama-bench"  # llama-bench工具路径
-CONTEXT_LENGTHS = [1024, 2048, 4096]  # 测试的上下文长度
-N_GEN = 16  # 生成token数量
-REPETITIONS = 1  # 重复次数
-FLASH_ATTN = 1  # 启用flash attention
+PROMPT_TOKENS = [16]  # 测试的prompt token数量
+N_GEN = [128]  # 生成token数量
+REPETITIONS = [1]  # 重复次数
+FLASH_ATTN = [1]  # 启用flash attention
+BATCH_SIZE = [1, 2, 4, 8, 16, 32]
+
 
 def find_gguf_files(directory):
     """查找指定目录下所有的.gguf文件"""
@@ -49,20 +53,16 @@ def should_test_gpu(model_path):
         return False
     return True
 
-def run_benchmark(model_path, context_length, use_gpu=True):
+def run_benchmark(model_path, prompt_tokens, n_gen, repetitions, flash_attn, batch_size, use_gpu=True):
     """运行单个模型的基准测试"""
-    # Q4_0模型使用更多重复次数以获得更稳定的结果
-    model_name = os.path.basename(model_path).upper()
-    repetitions = 5 if "Q4_0" in model_name else REPETITIONS
-    
     cmd = [
         LLAMA_BENCH_PATH,
         "-m", model_path,
-        "-fa", str(FLASH_ATTN),
-        "-d", str(context_length),
-        "-n", str(N_GEN),
+        "-fa", str(flash_attn),
+        "-p", str(prompt_tokens),  # -p 是 --n-prompt (prompt tokens)
+        "-n", str(n_gen),
         "-r", str(repetitions),
-        "-t", "4"
+        "-b", str(batch_size)
     ]
     
     # 如果是CPU测试，添加-ngl 0参数
@@ -76,7 +76,7 @@ def run_benchmark(model_path, context_length, use_gpu=True):
     env["QOS_CLASS_USER_INTERACTIVE"] = "1"
     
     try:
-        print(f"运行测试: {os.path.basename(model_path)} | {backend_type} | 上下文: {context_length}")
+        print(f"运行测试: {os.path.basename(model_path)} | {backend_type} | Prompt tokens:{prompt_tokens} | 生成:{n_gen} | 重复:{repetitions} | FlashAttn:{flash_attn} | 批量:{batch_size}")
         print(f"命令: QOS_CLASS_USER_INTERACTIVE=1 {' '.join(cmd)}")
         
         result = subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -87,16 +87,16 @@ def run_benchmark(model_path, context_length, use_gpu=True):
             print("--- 原始输出 ---")
             print(result.stdout)
             print("--- 原始输出结束 ---")
-            return result.stdout, backend_type, N_GEN, repetitions
+            return result.stdout, backend_type, n_gen, repetitions, flash_attn, batch_size
         else:
             print(f"✗ 测试失败: {result.stderr}")
-            return None, backend_type, N_GEN, repetitions
+            return None, backend_type, n_gen, repetitions, flash_attn, batch_size
     except FileNotFoundError:
         print(f"✗ 找不到llama-bench工具: {LLAMA_BENCH_PATH}")
-        return None, backend_type, N_GEN, repetitions
+        return None, backend_type, n_gen, repetitions, flash_attn, batch_size
     except Exception as e:
         print(f"✗ 运行测试时出错: {e}")
-        return None, backend_type, N_GEN, repetitions
+        return None, backend_type, n_gen, repetitions, flash_attn, batch_size
 
 def extract_tokens_per_second(output):
     """使用正则表达式提取tokens/s数据"""
@@ -109,33 +109,64 @@ def extract_tokens_per_second(output):
         pattern = r'(\d+\.\d+)\s*±\s*(\d+\.\d+)'
         matches = re.findall(pattern, output)
         
-        # 匹配测试类型 pp512 @ d1024 或 tg16 @ d1024
-        test_pattern = r'(pp\d+|tg\d+)\s*@\s*d(\d+)'
-        test_matches = re.findall(test_pattern, output)
-        
-        print(f"找到 {len(matches)} 个性能数据匹配")
-        print(f"找到 {len(test_matches)} 个测试类型匹配")
-        
-        # 配对性能数据和测试类型
-        for i, (avg_ts, stddev_ts) in enumerate(matches):
-            result = {}
-            result['avg_ts'] = float(avg_ts)
-            result['stddev_ts'] = float(stddev_ts)
+        # 查找表格数据行（包含测试类型和性能数据）
+        for line in lines:
+            # 跳过表头和分隔符行
+            if '|' not in line or '---' in line or 'model' in line or 'test' in line:
+                continue
             
-            if i < len(test_matches):
-                test_type, context = test_matches[i]
-                result['test_type'] = test_type
-                result['context_length'] = int(context)
+            # 分割表格列
+            columns = [col.strip() for col in line.split('|')]
+            
+            # 确保有足够的列（至少8列：空，model，size，params，backend，ngl，n_batch，fa，test，t/s）
+            if len(columns) >= 10:
+                test_type = columns[8].strip()  # test列
+                ts_column = columns[9].strip()  # t/s列
                 
-                if test_type.startswith('pp'):
-                    result['phase'] = 'prompt_processing'
-                elif test_type.startswith('tg'):
-                    result['phase'] = 'token_generation'
-            
-            results.append(result)
-            
+                # 提取性能数据 (例如: "159.21 ± 0.00")
+                ts_match = re.match(r'([\d.]+)\s*±\s*([\d.]+)', ts_column)
+                if ts_match and test_type:
+                    avg_ts = float(ts_match.group(1))
+                    stddev_ts = float(ts_match.group(2))
+                    
+                    result = {
+                        'avg_ts': avg_ts,
+                        'stddev_ts': stddev_ts,
+                        'test_type': test_type
+                    }
+                    
+                    # 根据测试类型确定phase
+                    if test_type.startswith('pp'):
+                        result['phase'] = 'prompt_processing'
+                    elif test_type.startswith('tg'):
+                        result['phase'] = 'token_generation'
+                    else:
+                        result['phase'] = 'unknown'
+                    
+                    results.append(result)
+                    print(f"解析到: {test_type} -> {result['phase']}: {avg_ts:.2f} t/s")
+        
+        print(f"总共解析到 {len(results)} 个测试结果")
+        
     except Exception as e:
-        print(f"正则表达式解析出错: {e}")
+        print(f"解析表格输出时出错: {e}")
+        # 如果表格解析失败，尝试简单的数值提取
+        try:
+            # 备用方案：只提取数值，不区分phase
+            pattern = r'(\d+\.\d+)\s*±\s*(\d+\.\d+)'
+            matches = re.findall(pattern, output)
+            print(f"备用方案：找到 {len(matches)} 个数值")
+            
+            for avg_ts, stddev_ts in matches:
+                result = {
+                    'avg_ts': float(avg_ts),
+                    'stddev_ts': float(stddev_ts),
+                    'phase': 'unknown'
+                }
+                results.append(result)
+                
+        except Exception as e2:
+            print(f"备用解析也失败: {e2}")
     
     return results
 
@@ -170,8 +201,8 @@ def load_existing_results():
         with open(CSV_FILENAME, 'r', encoding='utf-8') as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
-                # 创建唯一标识符：模型名_后端_上下文长度
-                test_key = f"{row['model_name']}_{row['backend']}_{row['context_length']}"
+                # 创建唯一标识符：模型名_后端_prompt tokens_生成tokens_重复次数_FlashAttn_批量大小
+                test_key = f"{row['model_name']}_{row['backend']}_{row['context_length']}_{row['n_gen']}_{row['repetitions']}_{row['flash_attn']}_{row['batch_size']}"
                 existing_tests.add(test_key)
         
         print(f"从CSV文件加载了 {len(existing_tests)} 个已完成的测试配置")
@@ -181,9 +212,9 @@ def load_existing_results():
     
     return existing_tests
 
-def is_test_already_done(model_name, backend, context_length, existing_tests):
+def is_test_already_done(model_name, backend, prompt_tokens, n_gen, repetitions, flash_attn, batch_size, existing_tests):
     """检查测试是否已经完成"""
-    test_key = f"{model_name}_{backend}_{context_length}"
+    test_key = f"{model_name}_{backend}_{prompt_tokens}_{n_gen}_{repetitions}_{flash_attn}_{batch_size}"
     return test_key in existing_tests
 
 def save_to_csv(row_data):
@@ -192,7 +223,7 @@ def save_to_csv(row_data):
         file_exists = os.path.exists(CSV_FILENAME)
         
         with open(CSV_FILENAME, 'a', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['model_name', 'backend', 'n_gen', 'repetitions', 'context_length', 'phase', 'tokens_per_sec']
+            fieldnames = ['model_name', 'backend', 'context_length', 'n_gen', 'repetitions', 'flash_attn', 'batch_size', 'phase', 'tokens_per_sec']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             if not file_exists:
@@ -227,13 +258,30 @@ def main():
     
     print(f"\n找到 {len(gguf_files)} 个GGUF文件")
     
+    # 生成所有参数组合
+    param_combinations = list(itertools.product(
+        PROMPT_TOKENS,
+        N_GEN,
+        REPETITIONS,
+        FLASH_ATTN,
+        BATCH_SIZE
+    ))
+    
+    print(f"参数组合数量: {len(param_combinations)}")
+    print("参数组合示例:")
+    for i, combo in enumerate(param_combinations[:3]):  # 显示前3个组合
+        prompt_tokens, n_gen, rep, flash, batch = combo
+        print(f"  {i+1}. Prompt tokens:{prompt_tokens}, 生成:{n_gen}, 重复:{rep}, FlashAttn:{flash}, 批量:{batch}")
+    if len(param_combinations) > 3:
+        print(f"  ... 以及其他 {len(param_combinations) - 3} 个组合")
+    
     # 计算总测试数
     total_tests = 0
     for model_path in gguf_files:
         if should_test_gpu(model_path):
-            total_tests += len(CONTEXT_LENGTHS) * 2  # CPU和GPU
+            total_tests += len(param_combinations) * 2  # CPU和GPU
         else:
-            total_tests += len(CONTEXT_LENGTHS)  # 只有CPU
+            total_tests += len(param_combinations)  # 只有CPU
     
     print(f"计划进行 {total_tests} 个基准测试")
     print("")
@@ -257,22 +305,26 @@ def main():
         if not test_gpu:
             print(f"⚠️  {model_name} 包含TQ量化，跳过GPU测试")
         
-        for context_length in CONTEXT_LENGTHS:
+        # 对每个参数组合运行测试
+        for prompt_tokens, n_gen, repetitions, flash_attn, batch_size in param_combinations:
             # CPU测试
             current_test += 1
             backend_type = "CPU"
             
             # 检查是否已经测试过
-            if is_test_already_done(model_name, backend_type, context_length, existing_tests):
-                print(f"\n进度: {current_test}/{total_tests} - ⏭️ 跳过已完成的测试: {model_name} | {backend_type} | 上下文:{context_length}")
+            if is_test_already_done(model_name, backend_type, prompt_tokens, n_gen, repetitions, flash_attn, batch_size, existing_tests):
+                print(f"\n进度: {current_test}/{total_tests} - ⏭️ 跳过已完成的测试: {model_name} | {backend_type} | 参数组合")
                 skipped_tests += 1
             else:
                 print(f"\n进度: {current_test}/{total_tests}")
                 
-                output, backend_type, n_gen, repetitions = run_benchmark(model_path, context_length, use_gpu=False)
+                output, backend_type, n_gen_used, repetitions_used, flash_attn_used, batch_size_used = run_benchmark(
+                    model_path, prompt_tokens, n_gen, repetitions, flash_attn, batch_size, use_gpu=False
+                )
+                
                 if output:
                     results = extract_tokens_per_second(output)
-                    print(f"📊 {model_name} | {backend_type} | 上下文:{context_length}")
+                    print(f"📊 {model_name} | {backend_type} | 参数组合结果")
                     for result in results:
                         tokens_per_sec = result.get('avg_ts', 0)
                         phase = result.get('phase', 'unknown')
@@ -282,9 +334,11 @@ def main():
                         csv_row = {
                             'model_name': model_name,
                             'backend': backend_type,
-                            'n_gen': n_gen,
-                            'repetitions': repetitions,
-                            'context_length': context_length,
+                            'context_length': prompt_tokens,
+                            'n_gen': n_gen_used,
+                            'repetitions': repetitions_used,
+                            'flash_attn': flash_attn_used,
+                            'batch_size': batch_size_used,
                             'phase': phase,
                             'tokens_per_sec': tokens_per_sec
                         }
@@ -299,16 +353,19 @@ def main():
                 gpu_backend_type = "GPU"
                 
                 # 检查是否已经测试过
-                if is_test_already_done(model_name, gpu_backend_type, context_length, existing_tests):
-                    print(f"\n进度: {current_test}/{total_tests} - ⏭️ 跳过已完成的测试: {model_name} | {gpu_backend_type} | 上下文:{context_length}")
+                if is_test_already_done(model_name, gpu_backend_type, prompt_tokens, n_gen, repetitions, flash_attn, batch_size, existing_tests):
+                    print(f"\n进度: {current_test}/{total_tests} - ⏭️ 跳过已完成的测试: {model_name} | {gpu_backend_type} | 参数组合")
                     skipped_tests += 1
                 else:
                     print(f"\n进度: {current_test}/{total_tests}")
                     
-                    output, backend_type, n_gen, repetitions = run_benchmark(model_path, context_length, use_gpu=True)
+                    output, backend_type, n_gen_used, repetitions_used, flash_attn_used, batch_size_used = run_benchmark(
+                        model_path, prompt_tokens, n_gen, repetitions, flash_attn, batch_size, use_gpu=True
+                    )
+                    
                     if output:
                         results = extract_tokens_per_second(output)
-                        print(f"📊 {model_name} | {backend_type} | 上下文:{context_length}")
+                        print(f"📊 {model_name} | {backend_type} | 参数组合结果")
                         for result in results:
                             tokens_per_sec = result.get('avg_ts', 0)
                             phase = result.get('phase', 'unknown')
@@ -318,9 +375,11 @@ def main():
                             csv_row = {
                                 'model_name': model_name,
                                 'backend': backend_type,
-                                'n_gen': n_gen,
-                                'repetitions': repetitions,
-                                'context_length': context_length,
+                                'context_length': prompt_tokens,
+                                'n_gen': n_gen_used,
+                                'repetitions': repetitions_used,
+                                'flash_attn': flash_attn_used,
+                                'batch_size': batch_size_used,
                                 'phase': phase,
                                 'tokens_per_sec': tokens_per_sec
                             }
@@ -328,7 +387,7 @@ def main():
                             all_results.append(csv_row)
                     else:
                         print("未获取到输出数据")
-    
+
     print(f"\n✅ 完成！")
     print(f"📊 新增测试结果: {len(all_results)} 条")
     print(f"⏭️ 跳过已完成测试: {skipped_tests} 个")
@@ -350,10 +409,13 @@ def main():
             mdfile.write("# GGUF模型基准测试报告\n\n")
             mdfile.write(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             mdfile.write(f"**测试目录**: `{MODEL_DIR}`\n\n")
-            mdfile.write(f"**上下文长度**: {', '.join(map(str, CONTEXT_LENGTHS))}\n\n")
-            mdfile.write(f"**生成token数**: {N_GEN}\n\n")
-            mdfile.write(f"**重复次数**: {REPETITIONS}\n\n")
-            mdfile.write(f"**Flash Attention**: {'启用' if FLASH_ATTN else '禁用'}\n\n")
+            mdfile.write(f"**参数配置**:\n")
+            mdfile.write(f"- Prompt tokens: {PROMPT_TOKENS}\n")
+            mdfile.write(f"- 生成token数: {N_GEN}\n")
+            mdfile.write(f"- 重复次数: {REPETITIONS}\n")
+            mdfile.write(f"- Flash Attention: {FLASH_ATTN}\n")
+            mdfile.write(f"- 批量大小: {BATCH_SIZE}\n")
+            mdfile.write(f"**参数组合总数**: {len(param_combinations)}\n\n")
             
             mdfile.write("## 测试结果\n\n")
             
@@ -370,39 +432,44 @@ def main():
                 mdfile.write(f"### {model_name}\n\n")
                 
                 # 创建表格头
-                mdfile.write("| 后端 | 上下文长度 | Prompt Processing (t/s) | Token Generation (t/s) |\n")
-                mdfile.write("|------|------------|-------------------------|------------------------|\n")
+                mdfile.write("| 后端 | Prompt tokens | 生成tokens | 重复次数 | FlashAttn | 批量大小 | Prompt Processing (t/s) | Token Generation (t/s) |\n")
+                mdfile.write("|------|---------------|------------|----------|-----------|----------|-------------------------|------------------------|\n")
                 
-                # 按后端和上下文长度组织数据
+                # 按参数组合组织数据
                 model_data = {}
                 for row in models[model_name]:
                     backend = row['backend']
-                    context_length = int(row['context_length'])
+                    prompt_tokens = int(row['context_length'])  # CSV中仍使用context_length字段名
+                    n_gen = int(row['n_gen'])
+                    repetitions = int(row['repetitions'])
+                    flash_attn = int(row['flash_attn'])
+                    batch_size = int(row['batch_size'])
                     phase = row['phase']
                     tokens_per_sec = float(row['tokens_per_sec'])
                     
-                    key = (backend, context_length)
+                    key = (backend, prompt_tokens, n_gen, repetitions, flash_attn, batch_size)
                     if key not in model_data:
                         model_data[key] = {}
                     model_data[key][phase] = tokens_per_sec
                 
-                # 按后端和上下文长度排序输出
-                for (backend, context_length) in sorted(model_data.keys(), key=lambda x: (x[0], x[1])):
-                    data = model_data[(backend, context_length)]
+                # 按参数组合排序输出
+                for key in sorted(model_data.keys()):
+                    backend, prompt_tokens, n_gen, repetitions, flash_attn, batch_size = key
+                    data = model_data[key]
                     pp_speed = data.get('prompt_processing', 'N/A')
                     tg_speed = data.get('token_generation', 'N/A')
                     
                     pp_str = f"{pp_speed:.2f}" if isinstance(pp_speed, (int, float)) else str(pp_speed)
                     tg_str = f"{tg_speed:.2f}" if isinstance(tg_speed, (int, float)) else str(tg_speed)
                     
-                    mdfile.write(f"| {backend} | {context_length} | {pp_str} | {tg_str} |\n")
+                    mdfile.write(f"| {backend} | {prompt_tokens} | {n_gen} | {repetitions} | {flash_attn} | {batch_size} | {pp_str} | {tg_str} |\n")
                 
                 mdfile.write("\n")
             
             # 生成统计信息
             mdfile.write("## 测试统计\n\n")
             mdfile.write(f"- **模型数量**: {len(models)}\n")
-            mdfile.write(f"- **上下文配置**: {', '.join(map(str, CONTEXT_LENGTHS))}\n")
+            mdfile.write(f"- **参数组合数**: {len(param_combinations)}\n")
             mdfile.write(f"- **总测试记录**: {len(csv_data)}\n")
             
             # 性能统计

@@ -29,7 +29,7 @@ if [ ! -f "tools/llama-bench/llama-bench" ]; then
     
     # 配置和编译
     echo "配置CMake..."
-    cmake .. -DCMAKE_BUILD_TYPE=Release
+    cmake .. -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON 
     
     if [ $? -ne 0 ]; then
         echo "CMake配置失败"
